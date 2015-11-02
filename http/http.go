@@ -3,12 +3,16 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	MQTT "git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.golang.git"
-	"github.com/callumj/iot-router/mqtt"
 	"io"
 	"log"
 	"net/http"
 	"time"
+
+	MQTT "git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.golang.git"
+	"github.com/dchest/uniuri"
+
+	"github.com/callumj/iot-router/message"
+	"github.com/callumj/iot-router/mqtt"
 )
 
 func hello(w http.ResponseWriter, r *http.Request) {
@@ -16,11 +20,20 @@ func hello(w http.ResponseWriter, r *http.Request) {
 }
 
 var mux map[string]func(http.ResponseWriter, *http.Request)
+var chanMap map[string]chan message.Response
 
 var c *MQTT.Client
 
 func main() {
+	chanMap = make(map[string]chan message.Response)
 	c = mqtt.CreateClient()
+
+	ref := c.Subscribe("http/responses", 0, HandleMqttMessage)
+	ref.Wait()
+	if err := ref.Error(); err != nil {
+		log.Println(err)
+		return
+	}
 
 	server := http.Server{
 		Addr:         ":8000",
@@ -34,52 +47,60 @@ func main() {
 
 type myHandler struct{}
 
+func HandleMqttMessage(client *MQTT.Client, msg MQTT.Message) {
+	var r message.Response
+	if err := json.Unmarshal(msg.Payload(), &r); err != nil {
+		log.Println(err)
+		return
+	}
+	log.Printf("Incoming: %v", r)
+	if ch, ok := chanMap[r.RequestId]; ok {
+		ch <- r
+	}
+}
+
 func (*myHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if h, ok := mux[r.URL.String()]; ok {
 		h(w, r)
 		return
 	}
 
-	t := time.Now().Unix()
-	data := struct {
-		RequestId string `"json:request_id"`
-	}{
-		fmt.Sprintf("%d", t),
+	formVals := map[string]string{}
+	if err := r.ParseForm(); err == nil {
+		for k, v := range r.Form {
+			if len(v) >= 0 {
+				formVals[k] = v[0]
+			}
+		}
+	}
+
+	t := time.Now().UnixNano()
+	data := message.Message{
+		RequestId:     fmt.Sprintf("%d-%s", t, uniuri.NewLen(5)),
+		RequestPath:   r.RequestURI,
+		RequestParams: formVals,
 	}
 	b, err := json.Marshal(data)
 	if err != nil {
 		log.Panic(err)
 	}
 
-	done := make(chan bool, 1)
+	chanMap[data.RequestId] = make(chan message.Response, 1)
 
-	sub := "/http/response" + data.RequestId
-	f := func(client *MQTT.Client, msg MQTT.Message) {
-		log.Printf("Response from MQTT: %q", msg)
-		io.WriteString(w, string(msg.Payload()))
-		c.Unsubscribe(sub)
-		done <- true
-	}
-
-	ref := c.Subscribe(sub, 0, f)
-	ref.Wait()
-	if ref.Error(); err != nil {
-		log.Println(err)
-		return
-	}
-	ch := "/http" + r.RequestURI
-	log.Printf("Notifying of '%s', waiting on %s", ch, sub)
-	tok := c.Publish(ch, 0, false, string(b))
+	log.Printf("Notifying of '%s'", data.RequestId)
+	tok := c.Publish("http/requests", 0, false, string(b))
 	tok.Wait()
 	if err := tok.Error(); err != nil {
 		log.Println(err)
 	}
 
 	select {
-	case <-done:
+	case resp := <-chanMap[data.RequestId]:
+		io.WriteString(w, resp.Data)
+		close(chanMap[data.RequestId])
+		chanMap[data.RequestId] = nil
 		log.Println("Done!")
 	case <-time.After(5 * time.Second):
-		c.Unsubscribe(sub)
 		http.Error(w, "Handler timed out", 500)
 	}
 }

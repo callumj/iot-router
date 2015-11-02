@@ -2,35 +2,56 @@ package main
 
 import (
 	"encoding/json"
-	MQTT "git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.golang.git"
-	"github.com/callumj/iot-router/mqtt"
 	"log"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
+
+	MQTT "git.eclipse.org/gitroot/paho/org.eclipse.paho.mqtt.golang.git"
+
+	"github.com/callumj/iot-router/message"
+	"github.com/callumj/iot-router/mqtt"
 )
 
 var TWIML = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-    <Message>The time is {MSG}</Message>
+    <Message>Hello! The time is {MSG}</Message>
+</Response>
+`
+
+var TWIML_CALL = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Say>Hello! The time is {MSG}</Say>
 </Response>
 `
 
 var f = func(client *MQTT.Client, msg MQTT.Message) {
 	log.Printf("Message: %s", msg)
-	var m struct {
-		RequestId string `"json:request_id"`
-	}
+	var m message.Message
 	if err := json.Unmarshal(msg.Payload(), &m); err != nil {
 		log.Println(err)
 		return
 	}
 
-	top := "/http/response" + m.RequestId
-	log.Printf("Delivering to %s", top)
-	t := client.Publish(top, 0, false, strings.Replace(TWIML, "{MSG}", time.Now().String(), 1))
+	twiml := TWIML
+	if strings.HasPrefix(m.RequestPath, "/twilio_call_callback") {
+		twiml = TWIML_CALL
+	} else if !strings.HasPrefix(m.RequestPath, "/twilio_sms_callback") {
+		return
+	}
+
+	data := message.Response{
+		RequestId: m.RequestId,
+		Data:      strings.Replace(twiml, "{MSG}", time.Now().String(), 1),
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		log.Panic(err)
+	}
+	log.Printf("Publishing: %v", data)
+	t := client.Publish("http/responses", 0, false, string(b))
 	t.Wait()
 	if err := t.Error(); err != nil {
 		log.Println(err)
@@ -40,7 +61,7 @@ var f = func(client *MQTT.Client, msg MQTT.Message) {
 func main() {
 	c := mqtt.CreateClient()
 
-	c.Subscribe("/http/twilio_sms_callback", 0, f)
+	c.Subscribe("http/requests", 0, f)
 
 	sigs := make(chan os.Signal, 1)
 	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
